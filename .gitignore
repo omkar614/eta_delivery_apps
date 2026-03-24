@@ -8,6 +8,7 @@ __pycache__/
 dist/
 build/
 .eggs/
+.python-version
 
 # Virtual environments
 .env
@@ -15,6 +16,10 @@ build/
 env/
 venv/
 
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 # Jupyter Notebooks
 .ipynb_checkpoints/
 *.ipynb_checkpoints
@@ -44,3 +49,7 @@ Thumbs.db
 *.log
 *.tmp
 *.cache
+
+# Project-generated artifacts
+models/
+outputs/

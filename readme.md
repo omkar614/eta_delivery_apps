@@ -1,195 +1,257 @@
-# Delivery ETA Analysis — Project Summary
+# ETA Error Classification
 
-**Domain:** Food Delivery Operations & Logistics Analytics  
-**Dataset:** DoorDash-style delivery records — Jan 21, 2015 to Feb 18, 2015  
-**Records:** 197,428 raw → 193,474 after cleaning  
-**Tools:** Python · pandas · numpy · matplotlib · seaborn · SQL  
+Real-time multiclass ETA risk classification for food delivery orders using XGBoost.
 
----
+## Objective
 
-## 1. Problem Statement
+Predict delivery risk at the moment an order is placed so operations teams can intervene before an order goes late.
 
-Food delivery platforms promise customers an estimated arrival time (ETA) at the moment of order.
-Inaccurate ETAs directly hurt customer satisfaction, increase support tickets, and erode trust.
+Classes:
 
-**Goal:** Analyze historical delivery data to understand *why* ETAs are inaccurate, identify the
-conditions that cause the most failures, quantify SLA performance, and simulate the impact of
-an ETA model improvement.
+| Class | Label | Rule |
+|---|---|---|
+| 0 | On-Time | `abs(actual_duration_mins - estimated_total_mins) <= 10` |
+| 1 | Mod-Late | `eta_error_mins > 10 and eta_error_mins <= 15` |
+| 2 | Breach | `eta_error_mins > 15` |
 
-**Business Questions:**
-- How accurate are current ETA estimates across different times, markets, and order types?
-- Which hours, days, and conditions drive the worst ETA errors?
-- At what order-load level does on-time performance significantly degrade?
-- What is the measurable impact of improving the ETA model?
+`eta_error_mins = actual_duration_mins - estimated_total_mins`
 
----
+## Current Implementation
 
-## 2. Dataset Description
+The project is implemented as a full Python pipeline in `src/`:
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `market_id` | int | Geographic delivery market (1–6) |
-| `created_at` | timestamp | When the order was placed |
-| `actual_delivery_time` | timestamp | When the order was delivered |
-| `store_id` | int | Unique store identifier |
-| `store_primary_category` | string | Food category (american, pizza, mexican, etc.) |
-| `order_protocol` | int | How order was received (1=App, 2=POS, 3=Fax, 4=Phone, 5=Tablet) |
-| `total_items` | int | Number of items in the order |
-| `subtotal` | int | Order value in cents |
-| `num_distinct_items` | int | Unique item types in the order |
-| `min_item_price` | int | Cheapest item price (cents) |
-| `max_item_price` | int | Most expensive item price (cents) |
-| `total_onshift_dashers` | float | Dashers available at order placement time |
-| `total_busy_dashers` | float | Dashers currently on a delivery |
-| `total_outstanding_orders` | float | Orders in queue without an assigned dasher |
-| `estimated_order_place_duration` | int | Platform's estimate to confirm order (seconds) |
-| `estimated_store_to_consumer_driving_duration` | float | Platform's drive time estimate (seconds) |
+| File | Purpose |
+|---|---|
+| `src/features.py` | Loads `data/cleaned_data.csv`, engineers leakage-safe features, builds target labels, prints class distribution |
+| `src/model_utils.py` | Shared constants, preprocessing pipeline, XGBoost configuration, metrics helpers |
+| `src/train.py` | Chronological split, time-series cross-validation, model fitting, model save, metrics save |
+| `src/evaluate.py` | Test-set metrics, confusion matrix, ROC curves, calibration curve, SHAP plots, final summary |
+| `src/predict.py` | Scores a single raw order dictionary with the trained pipeline |
 
-**Note:** The dataset provides two ETA *components* (order placement + driving), not a single
-end-to-end ETA figure. Actual delivery also includes food preparation time, which is not estimated
-in the raw data — this is a core source of systematic ETA underestimation.
+Outputs:
 
----
+| Path | Artifact |
+|---|---|
+| `models/eta_xgb_classifier_v1.pkl` | Trained pipeline |
+| `outputs/metrics.json` | Saved evaluation metrics |
+| `outputs/confusion_matrix.png` | Confusion matrix heatmap |
+| `outputs/roc_curves.png` | One-vs-rest ROC curves |
+| `outputs/calibration_breach.png` | Class 2 calibration plot |
+| `outputs/shap_bar_breach.png` | SHAP bar chart for breach class |
+| `outputs/shap_beeswarm_breach.png` | SHAP beeswarm plot for breach class |
 
-## 3. Data Cleaning
+## Data
 
-### What was cleaned and why
+Input file: `data/cleaned_data.csv`
 
-| Issue | Rows Affected | Action Taken |
-|-------|--------------|--------------|
-| `actual_delivery_time` is null | 7 rows | Dropped — cannot compute actual duration |
-| Delivery time < 5 mins or > 120 mins | 3,947 rows | Dropped as outliers (likely data errors) |
-| `total_onshift_dashers` null | 16,262 rows | Filled with column median |
-| `total_busy_dashers` null | 16,262 rows | Filled with column median |
-| `total_outstanding_orders` null | 16,262 rows | Filled with column median |
-| `estimated_store_to_consumer_driving_duration` null | 526 rows | Filled with column median |
-| `market_id` null | 987 rows | Filled with mode (most frequent market) |
-| `order_protocol` null | 995 rows | Filled with mode |
-| `store_primary_category` = "NA" or null | 4,760 rows | Replaced with "Unknown" |
+The code does not re-clean raw data. It loads the cleaned file directly and recomputes only the model features required for training and inference.
 
-**Final clean dataset: 193,474 rows across 26 columns**
+Important rule:
 
-### Feature Engineering
+- `actual_delivery_time` is used only to derive the target label.
+- `actual_delivery_time`, `actual_duration_mins`, and `eta_error_mins` are never used as model features.
 
-After cleaning, the following columns were derived:
+## Engineered Features
 
-| New Column | Formula | Purpose |
-|-----------|---------|---------|
-| `actual_duration_mins` | `(actual_delivery_time - created_at)` in minutes | Ground truth delivery time |
-| `estimated_total_mins` | `(estimated_order_place_duration + estimated_store_to_consumer_driving_duration) / 60` | Platform ETA baseline |
-| `eta_error_mins` | `actual_duration_mins - estimated_total_mins` | Signed error (positive = late) |
-| `abs_error` | `abs(eta_error_mins)` | For MAE calculation |
-| `hour_of_day` | `created_at.hour` | Time-of-day analysis |
-| `day_of_week` | `created_at.day_name()` | Day-of-week analysis |
-| `is_peak` | `hour_of_day in [11,12,13,18,19,20,21]` | Peak hour flag (lunch + dinner) |
-| `dasher_utilization` | `total_busy_dashers / total_onshift_dashers` | Capacity pressure metric |
+All model features are available at order placement time:
 
----
+- `hour_of_day`
+- `day_of_week`
+- `is_peak`
+- `is_weekend`
+- `dasher_utilization`
+- `dasher_availability`
+- `outstanding_per_dasher`
+- `estimated_total_mins`
+- `order_value_dollars`
+- `price_range`
+- `items_per_distinct`
+- `load_critical`
+- `market_id`
+- `store_primary_category`
+- `order_protocol`
 
-## 4. Exploratory Data Analysis
+Categorical columns are encoded with `OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)`.
 
-### Delivery Time Distribution
-- **Mean:** 47.1 minutes
-- **Median:** 44.3 minutes
-- Distribution is right-skewed — most orders deliver in 35–56 minutes, with a long tail
-- The platform's estimated ETA averages only **14.2 minutes** — a systematic underestimate
-  because it excludes food preparation time entirely
+## Model
 
-### Order Volume Patterns
-- **Peak hours** (11–13 lunch, 18–21 dinner) account for 44,776 orders — **23% of all volume**
-- Saturday and Friday evenings have the highest order density
-- The slowest average delivery hour is **14:00 (2 PM)** at 59.6 minutes
-- The fastest average delivery hour is **05:00 (5 AM)** at 40.4 minutes
+Model: `xgboost.XGBClassifier`
 
-### Top Food Categories by Volume
-| Category | Orders | Avg Delivery (mins) |
-|----------|--------|-------------------|
-| American | 19,070 | 47.1 |
-| Pizza | 17,052 | 50.0 |
-| Mexican | 16,719 | 44.4 |
-| Burger | 10,784 | 46.5 |
-| Sandwich | 9,804 | 44.5 |
-| Chinese | 9,220 | 47.4 |
-| Japanese | 8,969 | 50.8 |
-| Dessert | 8,524 | 47.4 |
+Configuration:
 
-**Finding:** Pizza and Japanese have the longest delivery times — likely due to higher
-meal complexity and preparation variance, which makes ETA prediction harder.
+```python
+XGBClassifier(
+    n_estimators=500,
+    learning_rate=0.05,
+    max_depth=6,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    min_child_weight=50,
+    objective="multi:softprob",
+    num_class=3,
+    eval_metric="mlogloss",
+    use_label_encoder=False,
+    random_state=42,
+    n_jobs=-1,
+    tree_method="hist",
+)
+```
 
----
+Training details:
 
-## 5. KPI Results
+- Chronological split only
+- Split date: `2015-02-10`
+- Cross-validation: `TimeSeriesSplit(n_splits=5)`
+- Imbalance handling: `compute_sample_weight(class_weight="balanced")`
+- Random seed: `42`
 
-### How KPIs were computed
+Note: in this environment, `cross_val_score(..., n_jobs=-1)` raised a Windows process permission error, so the implementation uses `n_jobs=1` for cross-validation. Model training still uses XGBoost with `n_jobs=-1`.
 
-The platform only provides *components* of an ETA (placement + drive time), not a complete
-end-to-end estimate. To compute realistic ETA KPIs:
+## Environment Setup
 
-1. A **baseline ETA model** was built: `eta = (estimated_total_mins × 2.8) + noise`
-   — the 2.8 multiplier accounts for preparation time not included in the raw estimates
-2. The dataset was split chronologically: **60% = Before** (Jan 21 – Feb 10), **40% = After**
-   (Feb 10 – Feb 18) to simulate a pre/post optimization scenario
-3. The "After" model has reduced noise standard deviation (10 → 7.2), representing a
-   better-calibrated ETA algorithm
+Create and activate a virtual environment in PowerShell:
 
-### Core KPI Scorecard
+```powershell
+cd "D:\projects\New folder\eta_delivery"
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
 
-| KPI | Before | After | Change |
-|-----|--------|-------|--------|
-| **Orders analyzed** | 116,084 | 77,390 | — |
-| **Avg Delivery Time** | 47.0 mins | 47.2 mins | — |
-| **MAE** (Mean Absolute Error) | 15.8 mins | 14.7 mins | ▼ 7% |
-| **MAPE** (Mean Abs % Error) | 34.5% | 31.1% | ▼ 3.4 pp |
-| **On-Time Rate** (±10 min) | 40.4% | 43.8% | ▲ 3.4 pp |
-| **Breach Rate** (>15 min late) | 15.9% | 10.9% | ▼ 5.0 pp |
-| **Peak On-Time Rate** | 42.5% | 45.4% | ▲ 2.9 pp |
+If activation is blocked:
 
-### KPI Definitions
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+```
 
-- **MAE:** Average of `|actual - estimated|` across all orders. Lower is better.
-- **MAPE:** `mean(|error| / actual) × 100`. Percentage-based, comparable across order sizes.
-- **On-Time Rate:** % of orders where absolute ETA error ≤ 10 minutes. The main SLA metric.
-- **Breach Rate:** % of orders where delivery was more than 15 minutes later than estimated.
-- **Peak On-Time Rate:** On-Time Rate calculated only during peak hours (lunch + dinner windows).
+Install dependencies:
 
----
+```powershell
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
 
-## 6. Key Findings
+## Run Order
 
-### Finding 1 — Systematic ETA Underestimation
-The platform's estimated ETA averages 14.2 minutes while actual delivery averages 47.1 minutes.
-This is because the estimate only covers order confirmation + driving — it ignores food
-preparation entirely. The ETA model needs a preparation time component specific to each
-food category.
+Run the scripts from the project root:
 
-### Finding 2 — Time-of-Day Congestion Pattern
-Average delivery time peaks at **2 PM (59.6 mins)** and late evening hours.
-Contrary to expectation, the dinner rush (7–8 PM) is not the worst window — the 2 PM
-shoulder period has fewer dashers on shift relative to demand, causing the longest delays.
-**Recommendation:** Adjust dasher scheduling to add coverage at 13:00–15:00.
+```powershell
+python src\features.py
+python src\train.py
+python src\evaluate.py
+python src\predict.py
+```
 
-### Finding 3 — Order Load Risk Threshold
-| Outstanding Orders | Avg Delivery (mins) |
-|-------------------|-------------------|
-| 1–5 (Low) | 47.1 |
-| 6–10 (Medium) | 44.8 |
-| 11–20 (High) | 44.7 |
-| 21–40 (Very High) | 45.1 |
-| 40+ (Critical) | 48.6 |
+## What Each Script Does
 
-Delivery time rises sharply once outstanding orders exceed 40. This is the operational
-alert threshold — at this point, dispatch logic should prioritize dasher reallocation.
+### `python src\features.py`
 
-### Finding 4 — Market Performance Benchmarking
-| Market | Orders | Avg Delivery (mins) | MAE |
-|--------|--------|-------------------|-----|
-| 1 | 36,962 | 50.0 | 35.8 |
-| 2 | 55,108 | 45.8 | 31.5 |
-| 3 | 22,854 | 46.9 | 32.2 |
-| 4 | 46,715 | 46.9 | 33.1 |
-| 5 | 17,698 | 46.1 | 31.3 |
-| 6 | 14,137 | 46.7 | 32.8 |
+- Loads `data/cleaned_data.csv`
+- Recomputes the target label
+- Recomputes the project feature set
+- Prints the overall class distribution
 
-**Market 1** has the worst performance — highest delivery times and highest MAE — despite
-not being the busiest market. **Market 2** handles the most volume with the best accuracy.
-Market 2 operational practices should be documented and replicated in Market 1.
+### `python src\train.py`
+
+- Rebuilds features from the cleaned dataset
+- Splits data using `created_at < 2015-02-10`
+- Prints train and test class balance
+- Runs time-series cross-validation
+- Fits the full pipeline
+- Evaluates on the held-out test set
+- Saves model to `models/eta_xgb_classifier_v1.pkl`
+- Saves metrics to `outputs/metrics.json`
+
+### `python src\evaluate.py`
+
+- Loads the saved pipeline
+- Recreates the held-out test split
+- Prints the classification report and metric table
+- Saves confusion matrix, ROC curves, calibration curve, and SHAP plots
+- Prints the final one-paragraph summary
+
+### `python src\predict.py`
+
+- Loads the saved model
+- Builds features for one sample order
+- Returns class, label, probabilities, and operations recommendation
+
+## Sample Inference Output
+
+The included sample order in `src/predict.py` scored as:
+
+- Predicted class: `2`
+- Label: `Breach`
+- Breach probability: `0.8184`
+- Recommendation: `ALERT — reassign nearest available dasher immediately.`
+
+## Latest Observed Results
+
+These are the metrics produced by the current implementation on this dataset:
+
+| Metric | Value |
+|---|---:|
+| Macro F1 | 0.3831 |
+| Weighted F1 | 0.7474 |
+| Class 2 Recall | 0.6868 |
+| Class 2 Precision | 0.9696 |
+| Class 2 F1 | 0.8040 |
+| CV Macro F1 Mean | 0.3206 |
+| CV Macro F1 Std | 0.0017 |
+
+Threshold check:
+
+- `Macro F1 >= 0.55`: not met
+- `Weighted F1 >= 0.60`: met
+- `Class 2 Recall >= 0.60`: met
+- `Class 2 Precision >= 0.45`: met
+
+## Important Finding About This Dataset
+
+The specified label rule produces a much more breach-heavy class distribution than the earlier project notes suggested.
+
+Observed overall class distribution from the current pipeline:
+
+| Class | Count | Percent |
+|---|---:|---:|
+| 0 | 5,653 | 2.88% |
+| 1 | 13,931 | 7.10% |
+| 2 | 176,744 | 90.02% |
+
+This is the main reason the current model achieves strong Class 2 precision and recall but weak macro F1. The model is learning on a dataset where most orders are labeled as breach under the requested target definition.
+
+## SHAP Findings
+
+Top 5 features for Class 2 in the latest run:
+
+1. `outstanding_per_dasher`
+2. `hour_of_day`
+3. `order_value_dollars`
+4. `order_protocol`
+5. `store_primary_category`
+
+This aligns with the idea that queue pressure and timing are strong breach signals, but the exact ranking is from the trained model rather than assumed from EDA.
+
+## Dependencies
+
+See `requirements.txt`.
+
+Current project requirements:
+
+```text
+pandas>=1.5
+numpy>=1.23
+scikit-learn>=1.2
+xgboost>=1.7
+shap>=0.41
+matplotlib>=3.6
+seaborn>=0.12
+joblib>=1.2
+```
+
+## Notes
+
+- The README previously referenced LightGBM and a preprocessing script; that is no longer accurate for this repository.
+- The repository currently uses XGBoost end to end.
+- All plots are saved to disk; no script uses `plt.show()`.
+- The code is written so training and inference share the same feature logic.
